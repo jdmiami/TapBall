@@ -186,22 +186,30 @@ function update() {
 }
 
 function openMenu() {
+  // Toggle the menu state
   gameState.menuOpen = !gameState.menuOpen;
-  menu.setVisible(gameState.menuOpen);
 
+  // Pause or resume the game based on the menu state
   if (gameState.menuOpen) {
-    this.tweens.add({
-      targets: this.cameras.main,
-      y: -window.innerHeight * 0.3,
-      duration: 500,
-      ease: 'Power2'
-    });
+    // Pause the game physics and stop any movement
+    this.physics.pause();
+    ball.setVelocity(0, 0);
+
+    // Display the menu options with a slight delay to allow the pause effect to be noticed
+    setTimeout(() => {
+      menu.setVisible(true);
+      // Animate the menu appearance if needed, using Phaser Tweens, for example
+      this.tweens.add({
+        targets: menu,
+        alpha: { from: 0, to: 1 },
+        duration: 500
+      });
+    }, 100); // Delay in milliseconds
   } else {
-    this.tweens.add({
-      targets: this.cameras.main,
-      y: 0,
-      duration: 500,
-      ease: 'Power2'
-    });
+    // Resume the game physics
+    this.physics.resume();
+
+    // Hide the menu options immediately
+    menu.setVisible(false);
   }
 }

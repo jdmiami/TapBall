@@ -191,27 +191,29 @@ function openMenu() {
 
   // Pause or resume the game based on the menu state
   if (gameState.menuOpen) {
-    // Pause the game physics
+    // Pause the game physics and all the tweens
     this.physics.pause();
-
-    // Set the menu visibility
-    menu.setVisible(true);
-
-    // Ensure the menu has a contrasting color and is fully opaque
-    menu.setAlpha(1);
-    menu.setStyle({ backgroundColor: '#ffffff', color: '#000000' }); // Example contrasting style
-
-    // Optionally, stop any animations or tweens if they are part of the game
     this.tweens.pauseAll();
 
-  } else {
-    // Resume the game physics
-    this.physics.resume();
+    // Set the menu visibility to true and ensure it's on top of the game
+    menu.setVisible(true);
+    menu.setDepth(100); // Ensure the menu is above all other game objects
 
-    // Hide the menu
+    // If the menu is a Phaser DOM element, apply styles directly
+    // If it's an HTML element styled with CSS, ensure the CSS has high contrast colors and is visible
+    menu.setAlpha(1); // Make sure the menu is fully opaque
+
+    // If there are other game elements or logic that need to be paused, handle them here
+    // For example, pausing a game timer or disabling input
+  } else {
+    // Resume the game physics and all the tweens
+    this.physics.resume();
+    this.tweens.resumeAll();
+
+    // Set the menu visibility to false
     menu.setVisible(false);
 
-    // Optionally, resume any animations or tweens if they are part of the game
-    this.tweens.resumeAll();
+    // Resume other game elements or logic that were paused
   }
 }
+

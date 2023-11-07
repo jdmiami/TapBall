@@ -87,21 +87,19 @@ function onPointerDown(pointer) {
   const dy = pointer.y - ball.y;
 
   if (dx * dx + dy * dy <= gameState.ballSize * gameState.ballSize) {
-      const direction = new Phaser.Math.Vector2(Phaser.Math.Between(-1, 1), Phaser.Math.Between(-1, 1)).normalize();
+      // Generate a random angle in radians
+      const randomAngle = Phaser.Math.FloatBetween(0, 2 * Math.PI);
+      const speed = gameState.score === 0 ? gameState.maxSpeed : gameState.speed * 1.03;
+      
+      // Convert the angle to a direction vector
+      const directionX = Math.cos(randomAngle);
+      const directionY = Math.sin(randomAngle);
 
-      if (direction.x !== 0 || direction.y !== 0) {
-          if (gameState.score === 0) {
-              ball.setVelocity(direction.x * gameState.maxSpeed, direction.y * gameState.maxSpeed);
-          } else {
-              gameState.speed = Math.sqrt(ball.body.velocity.x * ball.body.velocity.x + ball.body.velocity.y * ball.body.velocity.y);
-              const speedMultiplier = 1.03;
-              ball.setVelocity(direction.x * gameState.speed * speedMultiplier, direction.y * gameState.speed * speedMultiplier);
-          }
+      ball.setVelocity(directionX * speed, directionY * speed);
 
-          gameState.score++;
-          scoreText.setText(gameState.score.toString());
-          changeBallProperties.bind(this)();
-      }
+      gameState.score++;
+      scoreText.setText(gameState.score.toString());
+      changeBallProperties.bind(this)();
   } else {
       gameState.score = 0;
       scoreText.setText(gameState.score.toString());

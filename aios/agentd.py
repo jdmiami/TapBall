@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""aios agentd - boot skeleton (Milestone 1).
+"""aios agentd - boot loop (Milestones 1-2).
 
 A transparent, user-owned agent runtime loop. Runs as the owner's own user,
 logs what it does, and stops when the STOP file appears. Standard library only.
@@ -13,13 +13,22 @@ Each cycle:
      pinned public key BEFORE reading any manifest field.
   5. Download each listed boot file to boot/<name>.part, check sha256 against
      the verified manifest, rename into place only on a match.
-  6. Run only the entrypoint the verified manifest names, as a child process
-     with run_timeout_seconds and a working directory inside ~/.aios/.
+  6. Run only the entrypoint the verified manifest names, as a sandboxed child
+     process with run_timeout_seconds and a working directory inside ~/.aios/.
   7. Append one JSON line to ~/.aios/logs/agentd.log for each fetch,
      verification result, run, and error; update a heartbeat file each cycle.
 
+Milestone 2 (hardening) adds, without changing any of the above guarantees:
+  * size-based rotation of the log file (inside logs/ only);
+  * a structured result record per run (inside results/ only);
+  * a richer heartbeat plus `--status` / `--version` CLI;
+  * child-process sandboxing: scrubbed environment, its own process group
+    (so a timeout kills the whole group), optional CPU/memory RLIMITs, and a
+    dedicated per-run working directory.
+
 Security posture: nothing fetched is run until its signature AND its hash both
 pass. Network calls go only to server_url. Writes happen only inside ~/.aios/.
+Nothing here hides processes or files, or blocks the STOP file or uninstall.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
@@ -38,6 +48,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+try:  # POSIX-only; used for optional child resource limits.
+    import resource
+except ImportError:  # pragma: no cover - non-POSIX
+    resource = None
+
+VERSION = "0.2.0"
 
 # --- Fixed layout under the aios home directory -----------------------------
 
@@ -49,6 +66,7 @@ LOG_DIR = AIOS_HOME / "logs"
 LOG_PATH = LOG_DIR / "agentd.log"
 HEARTBEAT_PATH = AIOS_HOME / "heartbeat.json"
 WORK_DIR = AIOS_HOME / "work"
+RESULTS_DIR = AIOS_HOME / "results"
 
 CONFIG_KEYS = (
     "server_url",
@@ -57,6 +75,19 @@ CONFIG_KEYS = (
     "max_backoff_seconds",
     "run_timeout_seconds",
 )
+
+# Defaults for the Milestone 2 optional config keys. Kept in module globals so
+# log() (which runs before any config is loaded) has sane values, and so a
+# Milestone 1 config with none of these keys still loads unchanged.
+DEFAULT_LOG_MAX_BYTES = 1_000_000
+DEFAULT_LOG_BACKUPS = 5
+DEFAULT_RESULTS_KEEP = 50
+
+_LOG_MAX_BYTES = DEFAULT_LOG_MAX_BYTES
+_LOG_BACKUPS = DEFAULT_LOG_BACKUPS
+
+# Output captured from a child run is bounded before it is recorded.
+RESULT_OUTPUT_TAIL_BYTES = 16_384
 
 
 class AiosError(Exception):
@@ -67,8 +98,36 @@ class AiosError(Exception):
 
 
 def _ensure_dirs() -> None:
-    for d in (AIOS_HOME, BOOT_DIR, LOG_DIR, WORK_DIR):
+    for d in (AIOS_HOME, BOOT_DIR, LOG_DIR, WORK_DIR, RESULTS_DIR):
         d.mkdir(parents=True, exist_ok=True)
+
+
+def _rotate_log_if_needed() -> None:
+    """Size-based rotation entirely inside logs/. Best effort; never raises."""
+    try:
+        if _LOG_MAX_BYTES <= 0:
+            return
+        try:
+            size = LOG_PATH.stat().st_size
+        except FileNotFoundError:
+            return
+        if size < _LOG_MAX_BYTES:
+            return
+        # Drop the oldest, shift the rest up: .(_LOG_BACKUPS-1) -> .(_LOG_BACKUPS) ...
+        if _LOG_BACKUPS <= 0:
+            LOG_PATH.unlink(missing_ok=True)
+            return
+        oldest = LOG_DIR / f"agentd.log.{_LOG_BACKUPS}"
+        oldest.unlink(missing_ok=True)
+        for i in range(_LOG_BACKUPS - 1, 0, -1):
+            src = LOG_DIR / f"agentd.log.{i}"
+            dst = LOG_DIR / f"agentd.log.{i + 1}"
+            if src.exists():
+                src.replace(dst)
+        LOG_PATH.replace(LOG_DIR / "agentd.log.1")
+    except OSError:
+        # Rotation must never take the loop down.
+        pass
 
 
 def log(event: str, **fields: object) -> None:
@@ -78,6 +137,7 @@ def log(event: str, **fields: object) -> None:
     line = json.dumps(record, sort_keys=True, default=str)
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _rotate_log_if_needed()
         with open(LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError:
@@ -85,8 +145,28 @@ def log(event: str, **fields: object) -> None:
         sys.stderr.write(line + "\n")
 
 
+# Mutable heartbeat state, surfaced in the heartbeat file and via --status.
+_STATE = {
+    "version": VERSION,
+    "consecutive_failures": 0,
+    "last_error": None,
+    "last_outcome": None,
+    "next_delay": None,
+}
+
+
 def write_heartbeat(cycle: int, status: str) -> None:
-    data = {"ts": time.time(), "pid": os.getpid(), "cycle": cycle, "status": status}
+    data = {
+        "ts": time.time(),
+        "pid": os.getpid(),
+        "cycle": cycle,
+        "status": status,
+        "version": _STATE["version"],
+        "consecutive_failures": _STATE["consecutive_failures"],
+        "last_error": _STATE["last_error"],
+        "last_outcome": _STATE["last_outcome"],
+        "next_delay": _STATE["next_delay"],
+    }
     try:
         tmp = HEARTBEAT_PATH.with_suffix(".json.part")
         tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
@@ -96,6 +176,19 @@ def write_heartbeat(cycle: int, status: str) -> None:
 
 
 # --- Config -----------------------------------------------------------------
+
+
+def _opt_positive_number(cfg: dict, key: str, default):
+    """Read an optional numeric config value; default when absent/None."""
+    if key not in cfg or cfg[key] is None:
+        return default
+    try:
+        val = float(cfg[key])
+    except (TypeError, ValueError) as exc:
+        raise AiosError(f"{key} must be a number: {exc}") from exc
+    if val <= 0:
+        raise AiosError(f"{key} must be positive")
+    return val
 
 
 def load_config() -> dict:
@@ -135,6 +228,24 @@ def load_config() -> dict:
         if val <= 0:
             raise AiosError(f"{name} must be positive")
 
+    # Milestone 2 optional keys (backward compatible).
+    log_max_bytes = _opt_positive_number(cfg, "log_max_bytes", DEFAULT_LOG_MAX_BYTES)
+    log_backups_raw = _opt_positive_number(cfg, "log_backups", DEFAULT_LOG_BACKUPS)
+    results_keep_raw = _opt_positive_number(cfg, "results_keep", DEFAULT_RESULTS_KEEP)
+    child_cpu_seconds = (
+        None if cfg.get("child_cpu_seconds") is None
+        else _opt_positive_number(cfg, "child_cpu_seconds", None)
+    )
+    child_memory_bytes = (
+        None if cfg.get("child_memory_bytes") is None
+        else _opt_positive_number(cfg, "child_memory_bytes", None)
+    )
+
+    # Keep the log-rotation globals in step with the live config.
+    global _LOG_MAX_BYTES, _LOG_BACKUPS
+    _LOG_MAX_BYTES = int(log_max_bytes)
+    _LOG_BACKUPS = int(log_backups_raw)
+
     return {
         "server_url": server_url,
         "server_host": parsed.netloc,
@@ -142,6 +253,11 @@ def load_config() -> dict:
         "poll_seconds": poll_seconds,
         "max_backoff_seconds": max_backoff_seconds,
         "run_timeout_seconds": run_timeout_seconds,
+        "log_max_bytes": int(log_max_bytes),
+        "log_backups": int(log_backups_raw),
+        "results_keep": int(results_keep_raw),
+        "child_cpu_seconds": None if child_cpu_seconds is None else float(child_cpu_seconds),
+        "child_memory_bytes": None if child_memory_bytes is None else int(child_memory_bytes),
     }
 
 
@@ -292,44 +408,169 @@ def download_boot_file(entry: dict, server_url: str, timeout: float) -> Path:
     return final_path
 
 
-# --- Entrypoint execution ----------------------------------------------------
+# --- Entrypoint execution (sandboxed child) ---------------------------------
 
 
-def run_entrypoint(entrypoint: str, run_timeout_seconds: float) -> None:
-    """Run the verified entrypoint as a child process inside ~/.aios/work.
+def _scrubbed_env(run_dir: Path) -> dict:
+    """A minimal environment for the child: no inherited secrets."""
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(run_dir),
+        "TMPDIR": str(run_dir),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "AIOS_RUN_DIR": str(run_dir),
+    }
+
+
+def _child_preexec(cpu_seconds, memory_bytes):
+    """Return a preexec_fn that isolates the child into its own session and
+    applies optional resource limits. POSIX only."""
+
+    def _preexec():  # pragma: no cover - runs in the forked child
+        os.setsid()  # own session + process group, so we can kill the whole tree
+        if resource is not None:
+            if cpu_seconds is not None:
+                c = int(cpu_seconds)
+                resource.setrlimit(resource.RLIMIT_CPU, (c, c + 1))
+            if memory_bytes is not None:
+                m = int(memory_bytes)
+                resource.setrlimit(resource.RLIMIT_AS, (m, m))
+
+    return _preexec
+
+
+def _tail_bytes(data: bytes, limit: int = RESULT_OUTPUT_TAIL_BYTES):
+    """Return (text_tail, truncated) for a bounded, decoded view of output."""
+    if data is None:
+        return "", False
+    truncated = len(data) > limit
+    view = data[-limit:] if truncated else data
+    return view.decode("utf-8", errors="replace"), truncated
+
+
+def _write_result(record: dict) -> None:
+    """Persist one run result into results/, then prune to results_keep."""
+    try:
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(record["started"]))
+        # Millisecond suffix keeps names unique within a second.
+        ms = int((record["started"] % 1) * 1000)
+        path = RESULTS_DIR / f"{stamp}.{ms:03d}.json"
+        path.write_text(json.dumps(record, sort_keys=True, default=str), encoding="utf-8")
+    except OSError as exc:
+        log("result_write_error", error=str(exc))
+
+
+def _prune_results(keep: int) -> None:
+    try:
+        files = sorted(RESULTS_DIR.glob("*.json"))
+        excess = len(files) - max(0, keep)
+        for old in files[:excess]:
+            old.unlink(missing_ok=True)
+    except OSError as exc:
+        log("result_prune_error", error=str(exc))
+
+
+def run_entrypoint(entrypoint: str, run_timeout_seconds: float, limits: dict | None = None) -> dict:
+    """Run the verified entrypoint as a sandboxed child, record the result.
 
     The entrypoint must be one of the boot files that already passed hash
-    verification and landed in boot/.
+    verification and landed in boot/. Returns the result record dict.
     """
+    limits = limits or {}
     name = _safe_boot_name(entrypoint)
     target = BOOT_DIR / name
     if not target.is_file():
         raise AiosError(f"entrypoint {name!r} not present in boot/ after verification")
 
+    # Dedicated per-run working directory inside ~/.aios/work/.
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    run_dir = WORK_DIR / time.strftime("run-%Y%m%dT%H%M%S", time.gmtime(started))
+    suffix = 0
+    base = run_dir
+    while run_dir.exists():
+        suffix += 1
+        run_dir = Path(f"{base}-{suffix}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # `-I` isolates the interpreter (ignores PYTHON* env, no cwd on sys.path,
+    # no user site) as a defence against planted modules.
     cmd = [sys.executable, "-I", str(target)]
-    log("run_start", entrypoint=name, timeout=run_timeout_seconds)
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(WORK_DIR),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=run_timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        log("run_timeout", entrypoint=name, timeout=run_timeout_seconds)
-        raise AiosError(f"entrypoint {name!r} timed out") from exc
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise AiosError(f"entrypoint {name!r} failed to launch: {exc}") from exc
-    log(
-        "run_end",
-        entrypoint=name,
-        returncode=proc.returncode,
-        stdout_bytes=len(proc.stdout or b""),
-        stderr_bytes=len(proc.stderr or b""),
+    preexec = None
+    start_new_session = False
+    if os.name == "posix":
+        preexec = _child_preexec(limits.get("child_cpu_seconds"), limits.get("child_memory_bytes"))
+    else:
+        start_new_session = True  # best effort on non-POSIX
+
+    log("run_start", entrypoint=name, timeout=run_timeout_seconds, run_dir=str(run_dir))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(run_dir),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_scrubbed_env(run_dir),
+        preexec_fn=preexec,
+        start_new_session=start_new_session,
     )
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(timeout=run_timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_process_group(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = b"", b""
+    finally:
+        if proc.poll() is None:
+            _kill_process_group(proc)
+
+    duration = time.time() - started
+    out_tail, out_trunc = _tail_bytes(stdout)
+    err_tail, err_trunc = _tail_bytes(stderr)
+    record = {
+        "entrypoint": name,
+        "returncode": proc.returncode,
+        "timed_out": timed_out,
+        "started": started,
+        "duration_seconds": round(duration, 3),
+        "run_dir": str(run_dir),
+        "stdout_tail": out_tail,
+        "stdout_truncated": out_trunc,
+        "stderr_tail": err_tail,
+        "stderr_truncated": err_trunc,
+    }
+    _write_result(record)
+    _prune_results(int(limits.get("results_keep", DEFAULT_RESULTS_KEEP)))
+
+    if timed_out:
+        log("run_timeout", entrypoint=name, timeout=run_timeout_seconds)
+        raise AiosError(f"entrypoint {name!r} timed out")
+    log("run_end", entrypoint=name, returncode=proc.returncode,
+        duration_seconds=record["duration_seconds"])
+    return record
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Terminate the child and (on POSIX) its whole process group."""
+    try:
+        if os.name == "posix":
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            time.sleep(0.2)
+            if proc.poll() is None:
+                os.killpg(pgid, signal.SIGKILL)
+        else:  # pragma: no cover - non-POSIX
+            proc.terminate()
+            time.sleep(0.2)
+            if proc.poll() is None:
+                proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
 
 
 # --- One cycle ---------------------------------------------------------------
@@ -373,15 +614,63 @@ def run_cycle(cfg: dict) -> None:
     if entrypoint is None:
         log("no_entrypoint")
         return
-    run_entrypoint(str(entrypoint), cfg["run_timeout_seconds"])
+    limits = {
+        "child_cpu_seconds": cfg.get("child_cpu_seconds"),
+        "child_memory_bytes": cfg.get("child_memory_bytes"),
+        "results_keep": cfg.get("results_keep", DEFAULT_RESULTS_KEEP),
+    }
+    run_entrypoint(str(entrypoint), cfg["run_timeout_seconds"], limits)
+
+
+# --- Status CLI --------------------------------------------------------------
+
+
+def _read_log_tail(max_lines: int = 20) -> list:
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-max_lines:]:
+        line = line.strip()
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            out.append({"raw": line})
+    return out
+
+
+def print_status() -> int:
+    heartbeat = None
+    try:
+        heartbeat = json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        heartbeat = None
+    report = {
+        "version": VERSION,
+        "aios_home": str(AIOS_HOME),
+        "stop_file_present": STOP_PATH.exists(),
+        "heartbeat": heartbeat,
+        "log_tail": _read_log_tail(),
+    }
+    print(json.dumps(report, indent=2, sort_keys=True, default=str))
+    return 0
 
 
 # --- Main loop ---------------------------------------------------------------
 
 
 def main(argv: list | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--version" in args:
+        print(VERSION)
+        return 0
+    if "--status" in args:
+        return print_status()
+
     _ensure_dirs()
-    log("agentd_start", pid=os.getpid(), aios_home=str(AIOS_HOME))
+    log("agentd_start", pid=os.getpid(), aios_home=str(AIOS_HOME), version=VERSION)
 
     cycle = 0
     attempt = 0  # consecutive failures, drives backoff
@@ -396,9 +685,13 @@ def main(argv: list | None = None) -> int:
             cfg = load_config()
         except AiosError as exc:
             attempt += 1
+            _STATE["consecutive_failures"] = attempt
+            _STATE["last_error"] = str(exc)
+            _STATE["last_outcome"] = "config_error"
             log("error", phase="config", error=str(exc), attempt=attempt)
-            write_heartbeat(cycle, "error")
             delay = backoff_delay(attempt, base=1.0, cap=_fallback_cap())
+            _STATE["next_delay"] = round(delay, 3)
+            write_heartbeat(cycle, "error")
             if STOP_PATH.exists():
                 log("stop_requested", path=str(STOP_PATH))
                 return 0
@@ -409,14 +702,22 @@ def main(argv: list | None = None) -> int:
         try:
             run_cycle(cfg)
             attempt = 0
+            _STATE["consecutive_failures"] = 0
+            _STATE["last_error"] = None
+            _STATE["last_outcome"] = "ok"
+            delay = cfg["poll_seconds"]
+            _STATE["next_delay"] = round(delay, 3)
             log("cycle_ok", cycle=cycle)
             write_heartbeat(cycle, "idle")
-            delay = cfg["poll_seconds"]
         except AiosError as exc:
             attempt += 1
+            _STATE["consecutive_failures"] = attempt
+            _STATE["last_error"] = str(exc)
+            _STATE["last_outcome"] = "cycle_error"
             log("error", phase="cycle", error=str(exc), attempt=attempt)
-            write_heartbeat(cycle, "error")
             delay = backoff_delay(attempt, base=1.0, cap=cfg["max_backoff_seconds"])
+            _STATE["next_delay"] = round(delay, 3)
+            write_heartbeat(cycle, "error")
 
         # Sleep, but wake promptly if a stop is requested.
         if STOP_PATH.exists():

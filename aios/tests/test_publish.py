@@ -101,6 +101,35 @@ class BuildTest(_TempDirCase):
             publish.build(src, "main.py", self.priv, self.td / "out")
         publish.build(src, "main.py", self.priv, self.td / "out", force=True)
 
+    def _leftovers(self, out):
+        return sorted(p.name for p in out.iterdir() if p.name != "boot")
+
+    def test_force_rebuild_replaces_output(self):
+        src = self.make_src()
+        out = self.td / "out"
+        publish.build(src, "main.py", self.priv, out)
+        (src / "main.py").write_text("print('v2')\n")
+        publish.build(src, "main.py", self.priv, out, force=True)
+        self.assertEqual((out / "boot" / "main.py").read_text(), "print('v2')\n")
+        self.assertEqual(publish.verify(out, self.pub), [])
+        self.assertEqual(self._leftovers(out), [])
+
+    def test_failed_force_rebuild_keeps_existing_output(self):
+        # A rebuild that fails at signing must leave the served boot/ intact.
+        src = self.make_src()
+        out = self.td / "out"
+        publish.build(src, "main.py", self.priv, out)
+        before = {p.name: p.read_bytes() for p in (out / "boot").iterdir()}
+        bad_key = self.td / "not-a-key.pem"
+        bad_key.write_text("not a key\n")
+        (src / "main.py").write_text("print('v2')\n")
+        with self.assertRaises(publish.PublishError):
+            publish.build(src, "main.py", bad_key, out, force=True)
+        after = {p.name: p.read_bytes() for p in (out / "boot").iterdir()}
+        self.assertEqual(after, before)
+        self.assertEqual(publish.verify(out, self.pub), [])
+        self.assertEqual(self._leftovers(out), [])
+
 
 class VerifyTest(_TempDirCase):
     def setUp(self):
@@ -128,6 +157,35 @@ class VerifyTest(_TempDirCase):
         _, other_pub = publish.keygen(self.td / "other", name="other")
         problems = publish.verify(self.out, other_pub)
         self.assertEqual(problems, ["signature does not verify against the public key"])
+
+    def _sign_manifest(self, data) -> None:
+        """Replace boot/manifest.json with `data`, correctly signed."""
+        boot = self.out / "boot"
+        (boot / "manifest.json").write_bytes(json.dumps(data).encode())
+        subprocess.run(
+            ["openssl", "pkeyutl", "-sign", "-inkey", str(self.priv), "-rawin",
+             "-in", str(boot / "manifest.json"), "-out", str(boot / "manifest.sig")],
+            check=True, capture_output=True,
+        )
+
+    def test_signed_manifest_with_bad_structure_is_reported_not_raised(self):
+        self._sign_manifest({"entrypoint": "main.py", "boot_files": None})
+        self.assertEqual(publish.verify(self.out, self.pub),
+                         ["manifest is malformed: boot_files must be a list"])
+        self._sign_manifest({"entrypoint": None, "boot_files": ["main.py"]})
+        self.assertEqual(publish.verify(self.out, self.pub),
+                         ["manifest entry is not an object: 'main.py'"])
+
+    def test_signed_manifest_with_path_traversal_name_fails(self):
+        # A file outside boot/ whose hash matches must not make verify pass:
+        # agentd refuses this name, so verify has to as well.
+        payload = self.out / "payload"
+        payload.write_text("outside boot\n")
+        digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+        self._sign_manifest({"entrypoint": None,
+                             "boot_files": [{"name": "../payload", "sha256": digest}]})
+        self.assertEqual(publish.verify(self.out, self.pub),
+                         ["unsafe or missing boot file name: '../payload'"])
 
 
 class EndToEndTest(_TempDirCase):

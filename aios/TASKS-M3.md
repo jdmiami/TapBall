@@ -35,3 +35,7 @@ Each item is checked only after its verification output is in `VERIFY-M3.md`.
 - [x] `python3 -m py_compile aios/agentd.py aios/publish.py`
 - [x] `python3 -m unittest discover -s aios/tests -v` (M1 + M2 + M3)
 - [x] A manual keygen → build → verify → tamper → verify run
+
+## 7. Codex review on PR #3
+- [x] P1: `build --force` stages and verifies before replacing `boot/`; a failed rebuild leaves `boot/` intact
+- [x] P2: `verify` validates manifest structure and agentd's name/sha256 rules before touching files

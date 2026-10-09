@@ -157,29 +157,46 @@ def build(boot_src: Path, entrypoint: str, key: Path, out_dir: Path, force: bool
         raise PublishError(f"entrypoint {entrypoint!r} is not one of the boot files")
 
     dest = out_dir / "boot"
-    if dest.exists():
-        if not force:
-            raise PublishError(f"{dest} already exists; pass --force to replace it")
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+    if dest.exists() and not force:
+        raise PublishError(f"{dest} already exists; pass --force to replace it")
 
-    for e in entries:
-        shutil.copyfile(boot_src / e["name"], dest / e["name"])
-        if _sha256_file(dest / e["name"]) != e["sha256"]:
-            raise PublishError(f"{e['name']} changed while it was being copied")
+    # Build and verify in a staging directory next to boot/, and swap it in
+    # only after the signature checks out, so a failed rebuild never leaves a
+    # served boot/ partial or empty.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix="boot.staging-", dir=out_dir))
+    try:
+        for e in entries:
+            shutil.copyfile(boot_src / e["name"], stage / e["name"])
+            if _sha256_file(stage / e["name"]) != e["sha256"]:
+                raise PublishError(f"{e['name']} changed while it was being copied")
 
-    manifest = json.dumps(
-        {"entrypoint": entrypoint, "boot_files": entries}, indent=2, sort_keys=True
-    ).encode("utf-8") + b"\n"
-    manifest_path = dest / "manifest.json"
-    sig_path = dest / "manifest.sig"
-    manifest_path.write_bytes(manifest)
-    _run([openssl, "pkeyutl", "-sign", "-inkey", str(key), "-rawin",
-          "-in", str(manifest_path), "-out", str(sig_path)])
+        manifest = json.dumps(
+            {"entrypoint": entrypoint, "boot_files": entries}, indent=2, sort_keys=True
+        ).encode("utf-8") + b"\n"
+        manifest_path = stage / "manifest.json"
+        sig_path = stage / "manifest.sig"
+        manifest_path.write_bytes(manifest)
+        _run([openssl, "pkeyutl", "-sign", "-inkey", str(key), "-rawin",
+              "-in", str(manifest_path), "-out", str(sig_path)])
+        if not _verify_with_private_key(manifest, sig_path.read_bytes(), key):
+            raise PublishError("signature did not verify after signing; boot/ left unchanged")
 
-    if not _verify_with_private_key(manifest, sig_path.read_bytes(), key):
-        sig_path.unlink(missing_ok=True)
-        raise PublishError("signature did not verify after signing; removed manifest.sig")
+        os.chmod(stage, 0o755)  # mkdtemp creates 0700; match a normal mkdir
+        if dest.exists():
+            old = Path(tempfile.mkdtemp(prefix="boot.old-", dir=out_dir))
+            old.rmdir()
+            dest.rename(old)
+            try:
+                stage.rename(dest)
+            except OSError:
+                old.rename(dest)
+                raise
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            stage.rename(dest)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
     return dest
 
 
@@ -202,22 +219,39 @@ def verify(pub_dir: Path, pubkey: Path) -> list:
         # Same rule as agentd: no field is read from an unverified manifest.
         return ["signature does not verify against the public key"]
 
-    problems = []
+    # Apply agentd's structure and name rules before touching any file, so
+    # verify never passes a manifest agentd would refuse and never reads a
+    # path outside boot/.
     try:
         data = json.loads(manifest)
-        files = data["boot_files"]
-        entrypoint = data.get("entrypoint")
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    except json.JSONDecodeError as exc:
         return [f"manifest is malformed: {exc}"]
+    if not isinstance(data, dict) or not isinstance(data.get("boot_files"), list):
+        return ["manifest is malformed: boot_files must be a list"]
+
+    problems = []
     names = set()
-    for e in files:
+    for e in data["boot_files"]:
+        if not isinstance(e, dict):
+            problems.append(f"manifest entry is not an object: {e!r}")
+            continue
         name, expected = e.get("name"), e.get("sha256")
+        try:
+            agentd._safe_boot_name(name if isinstance(name, str) else "")
+        except agentd.AiosError:
+            problems.append(f"unsafe or missing boot file name: {name!r}")
+            continue
+        if not isinstance(expected, str) or len(expected) != 64 or any(
+                c not in "0123456789abcdef" for c in expected.lower()):
+            problems.append(f"invalid sha256 for {name}")
+            continue
         names.add(name)
-        path = boot / str(name)
+        path = boot / name
         if not path.is_file():
             problems.append(f"missing boot file: {name}")
-        elif _sha256_file(path) != expected:
+        elif _sha256_file(path) != expected.lower():
             problems.append(f"sha256 mismatch: {name}")
+    entrypoint = data.get("entrypoint")
     if entrypoint is not None and entrypoint not in names:
         problems.append(f"entrypoint {entrypoint!r} is not a listed boot file")
     return problems

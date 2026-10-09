@@ -27,6 +27,14 @@ Ran 38 tests in 6.995s  OK
 Ran 38 tests in 6.987s  OK
 ```
 
+After the Codex review fixes (section 5), again three runs:
+
+```
+Ran 42 tests in 7.247s  OK
+Ran 42 tests in 7.129s  OK
+Ran 42 tests in 7.704s  OK
+```
+
 Full verbose run (class/module suffixes trimmed):
 
 ```
@@ -183,12 +191,59 @@ positional arguments:
 
 ---
 
+## 5. Codex review fixes (PR #3)
+
+Codex reviewed commit `51af756` and raised two findings. Both held up when
+checked against the code, and both are fixed:
+
+- **P1: `build --force` deleted the live `boot/` before the new build
+  succeeded.** A failed rebuild of a served directory left `boot/` partial or
+  empty. `build` now writes and verifies in a `boot.staging-*` directory next
+  to `boot/` and swaps it in only after the signature self-check passes. On
+  failure the staging directory is removed and `boot/` is untouched.
+- **P2: `verify` did not validate a signed manifest's structure.**
+  `boot_files: null` raised an uncaught `TypeError`, and a name such as
+  `../payload` was hashed outside `boot/`, so `verify` could report OK for a
+  manifest agentd refuses. `verify` now checks the list and entry types and
+  applies `agentd._safe_boot_name` and agentd's sha256 format rule before it
+  touches any file.
+
+New tests run first against the old `publish.py` (commit `51af756`), then
+against the fixed one:
+
+```
+=== new tests vs OLD publish.py ===
+test_failed_force_rebuild_keeps_existing_output ... FAIL
+test_force_rebuild_replaces_output ... ok
+test_signed_manifest_with_bad_structure_is_reported_not_raised ... ERROR
+test_signed_manifest_with_path_traversal_name_fails ... FAIL
+TypeError: 'NoneType' object is not iterable
+AssertionError: {'main.py': b"print('v2')\n", 'manifest.json'[329 chars]1\n'} != {'manifest.sig': b"\xb9\x8c\xb6\x85\xbe<\x1f\[519 chars]1\n'}
+AssertionError: Lists differ: [] != ["unsafe or missing boot file name: '../payload'"]
+Ran 4 tests in 0.224s
+FAILED (failures=2, errors=1)
+
+=== same tests vs FIXED publish.py ===
+test_failed_force_rebuild_keeps_existing_output ... ok
+test_force_rebuild_replaces_output ... ok
+test_signed_manifest_with_bad_structure_is_reported_not_raised ... ok
+test_signed_manifest_with_path_traversal_name_fails ... ok
+Ran 4 tests in 0.270s
+OK
+```
+
+`test_force_rebuild_replaces_output` checks the success path. It passes on
+both versions and guards the new swap logic.
+
+---
+
 ## Summary
 
 | Check | Result |
 | --- | --- |
 | `py_compile` (agentd.py, publish.py) | PASS |
-| `unittest` (M1 + M2 + M3) | PASS 38/38, 3 consecutive runs |
+| `unittest` (M1 + M2 + M3) | PASS 42/42, 3 consecutive runs (38/38 before the Codex fixes) |
+| Codex findings reproduced on old code, fixed | PASS (section 5) |
 | Manual keygen → build → verify → tamper | PASS (all exits as expected) |
 | `bash -n aios/*.sh` | PASS (shellcheck unavailable) |
 | agentd.py / install.sh / uninstall.sh unchanged | Confirmed (empty diff vs M2) |

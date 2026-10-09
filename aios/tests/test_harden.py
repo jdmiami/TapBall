@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -75,6 +76,18 @@ class ConfigCompatTest(unittest.TestCase):
         _write_config(self.home, log_max_bytes=-1)
         with self.assertRaises(self.agentd.AiosError):
             self.agentd.load_config()
+
+    def test_non_finite_values_rejected_as_config_errors(self):
+        # Python's json accepts NaN/Infinity; they must be config errors, not
+        # crashes outside the AiosError path (Codex P2 on PR #2).
+        for key in ("poll_seconds", "max_backoff_seconds", "run_timeout_seconds",
+                    "log_max_bytes", "log_backups", "results_keep",
+                    "child_cpu_seconds", "child_memory_bytes"):
+            for bad in (float("nan"), float("inf")):
+                with self.subTest(key=key, value=bad):
+                    _write_config(self.home, **{key: bad})
+                    with self.assertRaises(self.agentd.AiosError):
+                        self.agentd.load_config()
 
 
 class LogRotationTest(unittest.TestCase):
@@ -182,28 +195,60 @@ class SandboxTest(unittest.TestCase):
         soft = int((Path(rec["run_dir"]) / "rlim.txt").read_text())
         self.assertEqual(soft, 3)
 
-    @unittest.skipUnless(os.name == "posix", "process groups only on POSIX")
-    def test_timeout_kills_whole_process_group(self):
-        # Parent spawns a grandchild that would write a marker after a long
-        # sleep, then the parent itself sleeps. The run times out fast; the
-        # whole group must die, so the marker never appears.
+    def _assert_timeout_kills_grandchild(self, grandchild_prelude: str) -> None:
+        """The entrypoint starts a grandchild that writes a marker 2s later,
+        then sleeps. The run times out after 1s. If the whole group was
+        killed, the marker never appears, even after waiting past 2s."""
         marker = os.path.join(self.home, "grandchild-marker")
+        grandchild = (f"{grandchild_prelude}import time; time.sleep(2); "
+                      f"open({marker!r}, 'w').write('x')")
         self._install_entrypoint(
             "import subprocess, sys, time\n"
-            f"subprocess.Popen([sys.executable, '-c', \"import time; time.sleep(10); open({marker!r},'w').write('x')\"])\n"
+            f"subprocess.Popen([sys.executable, '-c', {grandchild!r}],"
+            " stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
             "time.sleep(10)\n"
         )
+        started = time.time()
         # A timeout surfaces as AiosError (same contract as Milestone 1), and
         # the run result on disk records timed_out=True.
         with self.assertRaises(self.agentd.AiosError):
             self.agentd.run_entrypoint("entry.py", 1.0, {})
         results = sorted((Path(self.home) / "results").glob("*.json"))
         self.assertTrue(results)
-        rec = json.loads(results[-1].read_text())
-        self.assertTrue(rec["timed_out"])
-        # Give any surviving grandchild more than its sleep to prove it's dead.
-        time.sleep(1.5)
+        self.assertTrue(json.loads(results[-1].read_text())["timed_out"])
+        # Wait until well past the grandchild's 2s sleep before checking.
+        time.sleep(max(0.0, started + 3.5 - time.time()))
         self.assertFalse(os.path.exists(marker), "grandchild survived group kill")
+
+    @unittest.skipUnless(os.name == "posix", "process groups only on POSIX")
+    def test_timeout_kills_whole_process_group(self):
+        self._assert_timeout_kills_grandchild("")
+
+    @unittest.skipUnless(os.name == "posix", "process groups only on POSIX")
+    def test_timeout_kills_sigterm_ignoring_descendant(self):
+        # The leader exits on SIGTERM but the grandchild ignores it; the group
+        # must still get SIGKILL after the grace period (Codex P1 on PR #2).
+        self._assert_timeout_kills_grandchild(
+            "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); ")
+
+    def test_launch_failure_is_recoverable_error(self):
+        # A launch failure must surface as AiosError (logged, backed off),
+        # not escape the main loop and crash the daemon (Codex P2 on PR #2).
+        self._install_entrypoint("pass\n")
+        with mock.patch.object(sys, "executable", os.path.join(self.home, "no-such-python")):
+            with self.assertRaises(self.agentd.AiosError):
+                self.agentd.run_entrypoint("entry.py", 5.0, {})
+
+    @unittest.skipUnless(os.name == "posix", "RLIMIT only on POSIX")
+    def test_fractional_cpu_limit_rounds_up(self):
+        # 0.5s must not become a 0s RLIMIT_CPU (Codex P2 on PR #2).
+        self._install_entrypoint(
+            "import resource\n"
+            "soft, hard = resource.getrlimit(resource.RLIMIT_CPU)\n"
+            "open('rlim.txt','w').write(str(soft))\n"
+        )
+        rec = self.agentd.run_entrypoint("entry.py", 10.0, {"child_cpu_seconds": 0.5})
+        self.assertEqual(int((Path(rec["run_dir"]) / "rlim.txt").read_text()), 1)
 
 
 class StatusCliTest(unittest.TestCase):

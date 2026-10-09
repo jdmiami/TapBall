@@ -37,3 +37,10 @@ verification output is pasted into `VERIFY-M2.md`.
 - [x] `python3 -m unittest discover -s aios/tests -v` (M1 + M2 tests)
 - [x] `bash -n` on the shell scripts (shellcheck still unavailable)
 - [x] `agentd.py --status` / `--version` sample output
+
+## 7. Codex review on PR #2 (follow-up PR)
+- [x] P1: timeout SIGKILLs the whole group even after the leader exits
+- [x] P2: child launch failures are recoverable `AiosError`s, not daemon crashes
+- [x] P2: non-finite numeric config values are rejected as config errors
+- [x] P2: fractional `child_cpu_seconds` rounds up, never to 0
+- [x] Timeout regression test re-timed so it can actually fail

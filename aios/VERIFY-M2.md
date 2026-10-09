@@ -139,6 +139,61 @@ $ python3 aios/agentd.py --status
 
 ---
 
+## 5. Codex review fixes (follow-up to PR #2)
+
+Codex reviewed PR #2 (commit `6901fc7`) after it merged and raised four
+findings in `agentd.py`. All four held up when checked against the code and
+are fixed:
+
+| Finding | Problem | Fix |
+| --- | --- | --- |
+| P1 | On timeout, SIGKILL went to the group only if the leader was still alive, so a grandchild that ignored SIGTERM survived | Always SIGKILL the group (pgid = child pid, from `setsid`) after the grace period |
+| P2 | `Popen`/`preexec_fn` failures escaped as raw exceptions and crashed the daemon (a regression from M1) | Wrapped in `AiosError`, so the loop logs and backs off |
+| P2 | `NaN`/`Infinity` in config (Python's json accepts both) passed validation, then crashed or were used | `math.isfinite` check on every numeric key, M1 keys included |
+| P2 | `child_cpu_seconds: 0.5` became a 0s `RLIMIT_CPU` and killed the child at once | `math.ceil` |
+
+Also fixed: `test_timeout_kills_whole_process_group` could not fail. Its
+grandchild slept 10s but the test waited only 1.5s. It now uses a 2s
+grandchild and checks at 3.5s.
+
+New tests run first against the unfixed `agentd.py` (commit `abed304`):
+
+```
+test_fractional_cpu_limit_rounds_up ... ERROR
+test_launch_failure_is_recoverable_error ... ERROR
+test_non_finite_values_rejected_as_config_errors ...  (9 FAIL + 10 ERROR across 16 subtests)
+test_timeout_kills_sigterm_ignoring_descendant ... FAIL
+test_timeout_kills_whole_process_group ... ok
+AssertionError: True is not false : grandchild survived group kill
+FileNotFoundError: [Errno 2] No such file or directory: '.../no-such-python'
+ValueError: cannot convert float NaN to integer
+OverflowError: cannot convert float infinity to integer
+AssertionError: AiosError not raised
+FAILED (failures=9, errors=10)
+```
+
+Then against the fixed code:
+
+```
+test_non_finite_values_rejected_as_config_errors ... ok
+test_fractional_cpu_limit_rounds_up ... ok
+test_launch_failure_is_recoverable_error ... ok
+test_timeout_kills_sigterm_ignoring_descendant ... ok
+test_timeout_kills_whole_process_group ... ok
+Ran 5 tests in 7.072s
+OK
+```
+
+Full suite (M1 + M2 + M3), three consecutive runs:
+
+```
+Ran 46 tests in 11.607s  OK
+Ran 46 tests in 12.075s  OK
+Ran 46 tests in 12.266s  OK
+```
+
+---
+
 ## Summary
 
 | Check | Result |

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
@@ -186,8 +187,9 @@ def _opt_positive_number(cfg: dict, key: str, default):
         val = float(cfg[key])
     except (TypeError, ValueError) as exc:
         raise AiosError(f"{key} must be a number: {exc}") from exc
-    if val <= 0:
-        raise AiosError(f"{key} must be positive")
+    # Python's json accepts NaN and Infinity; neither is a usable setting.
+    if not math.isfinite(val) or val <= 0:
+        raise AiosError(f"{key} must be a positive finite number")
     return val
 
 
@@ -225,8 +227,8 @@ def load_config() -> dict:
         ("max_backoff_seconds", max_backoff_seconds),
         ("run_timeout_seconds", run_timeout_seconds),
     ):
-        if val <= 0:
-            raise AiosError(f"{name} must be positive")
+        if not math.isfinite(val) or val <= 0:
+            raise AiosError(f"{name} must be a positive finite number")
 
     # Milestone 2 optional keys (backward compatible).
     log_max_bytes = _opt_positive_number(cfg, "log_max_bytes", DEFAULT_LOG_MAX_BYTES)
@@ -430,7 +432,7 @@ def _child_preexec(cpu_seconds, memory_bytes):
         os.setsid()  # own session + process group, so we can kill the whole tree
         if resource is not None:
             if cpu_seconds is not None:
-                c = int(cpu_seconds)
+                c = math.ceil(cpu_seconds)  # RLIMIT_CPU is whole seconds; never round to 0
                 resource.setrlimit(resource.RLIMIT_CPU, (c, c + 1))
             if memory_bytes is not None:
                 m = int(memory_bytes)
@@ -505,16 +507,21 @@ def run_entrypoint(entrypoint: str, run_timeout_seconds: float, limits: dict | N
         start_new_session = True  # best effort on non-POSIX
 
     log("run_start", entrypoint=name, timeout=run_timeout_seconds, run_dir=str(run_dir))
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(run_dir),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_scrubbed_env(run_dir),
-        preexec_fn=preexec,
-        start_new_session=start_new_session,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(run_dir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_scrubbed_env(run_dir),
+            preexec_fn=preexec,
+            start_new_session=start_new_session,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Includes a failing setrlimit in preexec_fn. Keep it recoverable so
+        # the loop logs it and backs off instead of exiting.
+        raise AiosError(f"entrypoint {name!r} failed to launch: {exc}") from exc
     timed_out = False
     try:
         stdout, stderr = proc.communicate(timeout=run_timeout_seconds)
@@ -559,11 +566,19 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     """Terminate the child and (on POSIX) its whole process group."""
     try:
         if os.name == "posix":
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
+            # The child called setsid(), so its pid is the process-group id.
+            pgid = proc.pid
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                return  # the whole group is already gone
             time.sleep(0.2)
-            if proc.poll() is None:
+            # SIGKILL the group even if the leader already exited: a
+            # descendant may have ignored SIGTERM.
+            try:
                 os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         else:  # pragma: no cover - non-POSIX
             proc.terminate()
             time.sleep(0.2)
